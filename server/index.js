@@ -10,12 +10,13 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
-    maxHttpBufferSize: 1e8, // 100MB Max Packet Size
+    maxHttpBufferSize: 1e8, // 100MB Packet Limit
     pingTimeout: 60000, 
-    transports: ['websocket'], // Force WebSocket (Faster)
-    perMessageDeflate: false   // 🚀 SPEED BOOST: Disable compression for binary files
+    transports: ['websocket'], 
+    perMessageDeflate: false // Disable compression for speed
 });
 
+// Optional DB
 mongoose.connect('mongodb://127.0.0.1:27017/lanShareDB')
     .catch(err => console.log('DB Error (Ignore if offline):', err.message));
 
@@ -34,6 +35,7 @@ io.on('connection', (socket) => {
         io.emit('users_update', users);
     });
 
+    // Request Transfer (With Zombie Check)
     socket.on('request_transfer', (data) => {
         if (io.sockets.sockets.get(data.to)) {
             io.to(data.to).emit('incoming_request', { from: socket.id, ...data });
@@ -42,15 +44,25 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('response_transfer', (data) => io.to(data.to).emit('request_response', { from: socket.id, accepted: data.accepted }));
+    // Response (Accept/Reject)
+    socket.on('response_transfer', (data) => {
+        io.to(data.to).emit('request_response', { from: socket.id, ...data });
+    });
 
-    socket.on('file_chunk', (data) => io.to(data.to).emit('receive_chunk', data));
+    // File Chunk Relay
+    socket.on('file_chunk', (data) => {
+        io.to(data.to).emit('receive_chunk', data);
+    });
     
-    socket.on('window_ack', (data) => io.to(data.to).emit('ack_received', { offset: data.offset }));
+    // Acknowledgement Relay (CRITICAL FIX: Forwarding 'data' preserves transferId)
+    socket.on('window_ack', (data) => {
+        io.to(data.to).emit('ack_received', data); 
+    });
 
+    // Completion Signal
     socket.on('transfer_completed', async (logData) => {
         try { await TransferLog.create(logData); } catch(e) {}
-        io.to(logData.receiverId).emit('transfer_success', logData);
+        io.to(logData.receiverId).emit('transfer_completed', logData);
     });
 
     socket.on('disconnect', () => {
@@ -59,4 +71,5 @@ io.on('connection', (socket) => {
     });
 });
 
-server.listen(5000, '0.0.0.0', () => console.log(`🚀 High-Performance Server on 5000`));
+const PORT = 5000;
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server Running on ${PORT}`));
