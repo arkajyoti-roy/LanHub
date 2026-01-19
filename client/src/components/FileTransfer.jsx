@@ -6,8 +6,11 @@ import IncomingRequest from './transfer/IncomingRequest';
 const SOCKET_URL = `http://${window.location.hostname}:5000`;
 const API_URL = `http://${window.location.hostname}:5000`;
 
-const CHUNK_SIZE = 1 * 1024 * 1024; 
-const MAX_WINDOW_SIZE = 64; 
+// ⚡ PERFORMANCE CONFIGURATION
+const CHUNK_SIZE = 1 * 1024 * 1024; // 1MB Chunks (Best balance for Node.js)
+const MAX_WINDOW_SIZE = 128;        // 🚀 Max 128MB in flight (Massive speed for LAN Cable/5GHz)
+const MIN_WINDOW_SIZE = 4;          // 🛡️ Never drop below 4MB (Prevents 2.4GHz stalls)
+
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
 export default function FileTransfer({ authData }) {
@@ -17,7 +20,7 @@ export default function FileTransfer({ authData }) {
   // --- STATE ---
   const [onlineUsers, setOnlineUsers] = useState({}); 
   const [historyLogs, setHistoryLogs] = useState([]);
-  const [transfers, setTransfers] = useState([]); // ACTIVE transfers
+  const [transfers, setTransfers] = useState([]); 
   const [incomingReqs, setIncomingReqs] = useState([]); 
   
   const [selectedUser, setSelectedUser] = useState(null); 
@@ -30,9 +33,12 @@ export default function FileTransfer({ authData }) {
   useEffect(() => {
     fetchHistory();
     
+    // 🔌 HIGH PERFORMANCE SOCKET OPTIONS
     socketRef.current = io(SOCKET_URL, {
         auth: { token: authData.token },
-        reconnection: true, transports: ['websocket']
+        reconnection: true,
+        transports: ['websocket'], // Force WebSocket (No polling latency)
+        upgrade: false
     });
 
     const socket = socketRef.current;
@@ -49,7 +55,8 @@ export default function FileTransfer({ authData }) {
 
     socket.on('request_response', (data) => {
         if (data.accepted) {
-            setTimeout(() => startUploadEngine(data.transferId), 100);
+            // Instant start (No artificial delay)
+            startUploadEngine(data.transferId);
         } else {
             updateTransferUI(data.transferId, { status: "Rejected ❌", progress: 0 });
         }
@@ -59,10 +66,10 @@ export default function FileTransfer({ authData }) {
     socket.on('receive_chunk', (data) => handleChunk(data));
     socket.on('transfer_completed', (data) => {
         finalizeDownload(data.transferId);
-        // Do not fetch history immediately, let the UI showing "Done" persist for a moment
     });
 
-    watchdogRef.current = setInterval(checkStalledTransfers, 1000);
+    // 🐕 Fast Watchdog (500ms) to catch drops instantly
+    watchdogRef.current = setInterval(checkStalledTransfers, 500);
 
     return () => { socket.disconnect(); clearInterval(watchdogRef.current); };
   }, [authData.token]);
@@ -95,29 +102,20 @@ export default function FileTransfer({ authData }) {
 
       return Array.from(contacts).map(name => {
           const socketId = Object.keys(onlineUsers).find(key => onlineUsers[key] === name);
-          return {
-              name,
-              isOnline: !!socketId,
-              socketId: socketId || null 
-          };
+          return { name, isOnline: !!socketId, socketId: socketId || null };
       }).sort((a,b) => (b.isOnline - a.isOnline));
   }, [onlineUsers, historyLogs, authData.username]);
 
-
-  // MERGE & DEDUPLICATE
   const chatMessages = useMemo(() => {
       if (!selectedUser) return [];
 
-      // 1. Active Transfers (Flagged as isActive: true)
       const live = transfers
           .filter(t => t.peerName === selectedUser.name)
           .map(t => ({ ...t, isActive: true, timestamp: t.startTime }));
 
-      // 2. Past History (Database)
       const past = historyLogs
           .filter(l => l.sender === selectedUser.name || l.receiver === selectedUser.name)
           .filter(l => {
-              // Deduplicate: If this file is currently active, hide the DB log
               const isDuplicate = live.some(t => 
                   t.fileName === l.fileName && 
                   t.fileSize === l.fileSize && 
@@ -158,7 +156,7 @@ export default function FileTransfer({ authData }) {
           highestAckedOffset: 0, 
           receiverId: currentSocketId,
           receiverName: selectedUser.name, 
-          windowSize: 4, 
+          windowSize: 4, // Start conservative, ramp up fast
           chunksInFlight: 0, 
           lastAckTime: 0, 
           lastActivity: Date.now()
@@ -167,7 +165,7 @@ export default function FileTransfer({ authData }) {
       setTransfers(prev => [...prev, {
           id: transferId,
           peerName: selectedUser.name, 
-          type: 'outgoing', // Used for bubble color
+          type: 'outgoing',
           fileName: selectedFile.name,
           fileSize: selectedFile.size,
           progress: 0,
@@ -199,7 +197,7 @@ export default function FileTransfer({ authData }) {
           setTransfers(prev => [...prev, {
               id: req.transferId,
               peerName: req.senderName, 
-              type: 'incoming', // Used for bubble color
+              type: 'incoming',
               fileName: req.fileName,
               fileSize: req.fileSize,
               progress: 0,
@@ -213,58 +211,106 @@ export default function FileTransfer({ authData }) {
       });
   };
 
-  // --- 4. ENGINE CORE ---
+  // --- 4. ⚡ TURBO ENGINE CORE ---
+  
   const startUploadEngine = (id) => {
       const e = transferEngines.current.get(id);
-      if(e) { e.active=true; e.lastActivity=Date.now(); updateTransferUI(id, {status:"Sending..."}); pumpUploadPipeline(id); }
+      if(e) { 
+          e.active=true; 
+          e.lastActivity=Date.now(); 
+          updateTransferUI(id, {status:"Sending..."}); 
+          pumpUploadPipeline(id); 
+      }
   };
 
   const handleAck = (data) => {
       const engine = transferEngines.current.get(data.transferId);
       if (!engine || !engine.active) return;
+      
       if (data.offset > engine.highestAckedOffset) engine.highestAckedOffset = data.offset;
       engine.chunksInFlight = Math.max(0, engine.chunksInFlight - 1);
       engine.lastActivity = Date.now();
       
+      // 🚀 AGGRESSIVE ADAPTIVE SPEED
+      // 2.4GHz can have ping ~200ms. We should still grow the window!
       const timeDiff = Date.now() - engine.lastAckTime;
-      if (timeDiff < 100) engine.windowSize = Math.min(engine.windowSize + 2, MAX_WINDOW_SIZE);
-      else if (timeDiff < 300) engine.windowSize = Math.min(engine.windowSize + 1, MAX_WINDOW_SIZE);
+      
+      if (timeDiff < 200) { 
+          // Excellent Connection (LAN/5GHz) -> Double Growth
+          engine.windowSize = Math.min(engine.windowSize + 2, MAX_WINDOW_SIZE);
+      } else if (timeDiff < 600) {
+          // Good Connection (2.4GHz) -> Steady Growth
+          engine.windowSize = Math.min(engine.windowSize + 1, MAX_WINDOW_SIZE);
+      } else if (timeDiff > 1500) {
+          // Congestion -> Gentle Backoff (Don't crash to 1)
+          engine.windowSize = Math.max(engine.windowSize - 1, MIN_WINDOW_SIZE);
+      }
+      
       engine.lastAckTime = Date.now();
 
-      if (engine.highestAckedOffset + CHUNK_SIZE >= engine.file.size) finishSender(data.transferId, engine);
-      else pumpUploadPipeline(data.transferId);
+      if (engine.highestAckedOffset + CHUNK_SIZE >= engine.file.size) {
+          finishSender(data.transferId, engine);
+      } else {
+          pumpUploadPipeline(data.transferId);
+      }
   };
 
   const handleChunk = (data) => {
       const engine = transferEngines.current.get(data.transferId);
       if (!engine) return;
+      
       engine.lastActivity = Date.now();
-      if (!engine.chunkMap.has(data.offset)) { engine.chunkMap.set(data.offset, data.chunk); engine.receivedBytes += data.chunk.byteLength; }
+      if (!engine.chunkMap.has(data.offset)) { 
+          engine.chunkMap.set(data.offset, data.chunk); 
+          engine.receivedBytes += data.chunk.byteLength; 
+      }
+      
+      // ACK immediately to keep pipeline full
       socketRef.current.emit('window_ack', { to: data.from, offset: data.offset, transferId: data.transferId });
       
       const pct = Math.floor((engine.receivedBytes / data.total) * 100);
-      if (pct % 5 === 0 || pct >= 100) updateTransferUI(data.transferId, { progress: pct, status: `Downloading ${pct}%` });
+      
+      // Update UI less frequently for performance
+      if (pct % 5 === 0 || pct >= 100) {
+           updateTransferUI(data.transferId, { progress: pct, status: `Downloading ${pct}%` });
+      }
+      
       if (engine.receivedBytes >= engine.fileSize) finalizeDownload(data.transferId);
   };
 
   const pumpUploadPipeline = (id) => { 
       const e = transferEngines.current.get(id); 
       if(!e || !e.active) return; 
+      
+      // Keep pumping until window is full OR file is done
       while(e.active && e.chunksInFlight < e.windowSize && e.offset < e.file.size){ 
           const blob = e.file.slice(e.offset, e.offset+CHUNK_SIZE); 
           const r = new FileReader();
           const currentOffset = e.offset;
+          
           r.onload=(evt)=>{ 
              if(transferEngines.current.get(id)?.active) {
-                socketRef.current.emit('file_chunk', { transferId: id, from: socketRef.current.id, to: e.receiverId, chunk: evt.target.result, offset: currentOffset, total: e.file.size }); 
-                if(Math.random() > 0.7) { // Update UI often enough to see speed
+                socketRef.current.emit('file_chunk', { 
+                    transferId: id, 
+                    from: socketRef.current.id, 
+                    to: e.receiverId, 
+                    chunk: evt.target.result, 
+                    offset: currentOffset, 
+                    total: e.file.size 
+                }); 
+                
+                // Throttle UI updates to save CPU cycles
+                if(Math.random() > 0.7) {
                     const pct=Math.round((currentOffset/e.file.size)*100);
                     updateTransferUI(id, {progress:pct});
                 }
              }
           }; 
           r.readAsArrayBuffer(blob);
-          e.offset+=CHUNK_SIZE; e.chunksInFlight++; e.lastActivity=Date.now(); 
+          
+          e.offset+=CHUNK_SIZE; 
+          e.chunksInFlight++; 
+          e.lastActivity=Date.now(); 
       } 
   };
 
@@ -289,15 +335,23 @@ export default function FileTransfer({ authData }) {
   const finalizeDownload = (id) => { 
       const e = transferEngines.current.get(id); if(!e||e.finalized)return; e.finalized=true; 
       
-      // 1. SHOW "VERIFYING" STATUS
       updateTransferUI(id, {status:"Verifying Integrity..."}); 
       
       setTimeout(()=>{ 
-          const b=new Blob(Array.from(e.chunkMap.entries()).sort((a,b)=>a[0]-b[0]).map(x=>x[1])); 
-          const url = URL.createObjectURL(b);
+          // 🛡️ INTEGRITY CHECK: Sort & Merge
+          const sortedChunks = Array.from(e.chunkMap.entries()).sort((a,b)=>a[0]-b[0]).map(x=>x[1]);
+          const b = new Blob(sortedChunks); 
           
-          // 2. SHOW "DONE" STATUS & DOWNLOAD LINK
+          // 🛡️ VERIFY SIZE
+          if (b.size !== e.fileSize) {
+              console.error(`Integrity Mismatch! Expected ${e.fileSize}, got ${b.size}`);
+              updateTransferUI(id, {status: "Integrity Error ❌"});
+              return;
+          }
+
+          const url = URL.createObjectURL(b);
           updateTransferUI(id,{status:"Done ✅", progress:100, downloadUrl:url}); 
+          
           e.chunkMap.clear(); 
           setTimeout(fetchHistory, 5000); 
       }, 50); 
@@ -307,11 +361,15 @@ export default function FileTransfer({ authData }) {
       const now = Date.now();
       transferEngines.current.forEach((engine, transferId) => {
           if (!engine.active) return;
-          if (now - engine.lastActivity > 2500 && engine.type === 'send') {
+          
+          // Stuck? (Greater than 3s silence)
+          if (now - engine.lastActivity > 3000 && engine.type === 'send') {
+               // 🧠 SMART RECOVERY: Don't kill speed. Cut window in half.
                engine.offset = engine.highestAckedOffset || 0;
-               engine.windowSize = Math.max(4, Math.floor(engine.windowSize / 2));
+               engine.windowSize = Math.max(MIN_WINDOW_SIZE, Math.floor(engine.windowSize / 2));
                engine.chunksInFlight = 0;
-               updateTransferUI(transferId, { status: "Optimizing Connection..." });
+               
+               updateTransferUI(transferId, { status: "Recovering..." });
                pumpUploadPipeline(transferId);
                engine.lastActivity = now;
           }
@@ -377,8 +435,6 @@ export default function FileTransfer({ authData }) {
                 {selectedUser ? (
                     chatMessages.map((msg, idx) => {
                         const isMe = (msg.type === 'outgoing') || (msg.sender === authData.username);
-                        
-                        // 🟢 FIX: We treat it as 'active' if isActive is true OR if it's not a history log yet
                         const showProgress = msg.isActive === true; 
 
                         return (
@@ -394,14 +450,13 @@ export default function FileTransfer({ authData }) {
                                         <div style={{ fontWeight: 'bold', wordBreak:'break-all', fontSize:'0.95em' }}>{msg.fileName}</div>
                                     </div>
 
-                                    {/* 🟢 ALWAYS SHOW PROGRESS & STATUS FOR ACTIVE TRANSFERS */}
+                                    {/* Progress Bar (Always visible during active transfer) */}
                                     {showProgress ? (
                                         <div style={{ marginBottom:'5px' }}>
                                             <div style={{ width:'100%', height:'6px', background:'rgba(0,0,0,0.1)', borderRadius:'3px' }}>
                                                 <div style={{ width:`${msg.progress}%`, height:'100%', background: isMe ? '#128c7e' : '#3182ce', transition:'width 0.2s' }}></div>
                                             </div>
                                             <div style={{ fontSize:'0.75em', marginTop:'4px', display:'flex', justifyContent:'space-between', fontWeight:'bold', color: '#555' }}>
-                                                {/* This renders "Verifying...", "Sending...", etc */}
                                                 <span>{msg.status}</span> 
                                                 <span>{msg.progress}%</span>
                                             </div>
