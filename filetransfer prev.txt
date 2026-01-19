@@ -1,15 +1,13 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import io from 'socket.io-client';
-import UserList from './transfer/UserList';
-import TransferCard from './transfer/TransferCard';
-import IncomingRequest from './transfer/IncomingRequest';
 
 const SOCKET_URL = `http://${window.location.hostname}:5000`;
-const CHUNK_SIZE = 1 * 1024 * 1024; 
+const CHUNK_SIZE = 1 * 1024 * 1024; // 1MB
 const MAX_WINDOW_SIZE = 64;
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
 export default function FileTransfer({ authData }) {
+  // We use a ref for the socket so we can access it inside closures without deps issues
   const socketRef = useRef(null);
   
   const [isConnected, setIsConnected] = useState(false);
@@ -22,30 +20,31 @@ export default function FileTransfer({ authData }) {
   const transferEngines = useRef(new Map());
   const watchdogRef = useRef(null);
 
-  // MEMOIZED UPDATE: Prevents function recreation on every render
-  const updateTransferUI = useCallback((id, updates) => {
-      setTransfers(prev => {
-          const index = prev.findIndex(t => t.id === id);
-          if (index === -1) return prev;
-          const newTransfers = [...prev];
-          newTransfers[index] = { ...newTransfers[index], ...updates };
-          return newTransfers;
-      });
-  }, []);
-
+  // --- 1. SOCKET INITIALIZATION & AUTH ---
   useEffect(() => {
+    // Initialize Socket with Token
     socketRef.current = io(SOCKET_URL, {
         auth: { token: authData.token },
-        reconnection: true, transports: ['websocket']
+        reconnection: true,
+        transports: ['websocket']
     });
 
     const socket = socketRef.current;
-    socket.on('connect', () => setIsConnected(true));
-    socket.on('disconnect', () => setIsConnected(false));
+
+    const handleConnect = () => {
+        setIsConnected(true);
+        // We don't emit 'join' manually anymore, the server does it via Token
+    };
+    const handleDisconnect = () => setIsConnected(false);
+
+    socket.on('connect', handleConnect);
+    socket.on('disconnect', handleDisconnect);
     socket.on('users_update', (u) => setUsers(u));
 
+    // Watchdog
     watchdogRef.current = setInterval(checkStalledTransfers, 1000);
 
+    // --- TRANSFER LISTENERS ---
     socket.on('incoming_request', (data) => {
         setIncomingReqs(prev => prev.find(r => r.transferId === data.transferId) ? prev : [...prev, data]);
     });
@@ -97,27 +96,11 @@ export default function FileTransfer({ authData }) {
         socket.disconnect();
         clearInterval(watchdogRef.current);
     };
-  }, [authData.token, updateTransferUI]); 
+  }, [authData.token]);
 
-  // MEMOIZED HANDLERS (Passed to children)
-  const handleUserToggle = useCallback((uid) => {
-      setSelectedUsers(prev => prev.includes(uid) ? prev.filter(id => id !== uid) : [...prev, uid]);
-  }, []);
+  // --- LOGIC FUNCTIONS (Watchdog, Pump, Send, Receive) ---
+  // (Copied from previous step, adapted to use socketRef.current)
 
-  const handleIncomingDecision = useCallback((req, accepted) => {
-      setIncomingReqs(prev => prev.filter(r => r.transferId !== req.transferId));
-      if (accepted) {
-          transferEngines.current.set(req.transferId, {
-              type: 'receive', fileSize: req.fileSize, fileName: req.fileName, chunkMap: new Map(), receivedBytes: 0, senderId: req.from, lastActivity: Date.now()
-          });
-          setTransfers(prev => [...prev, {
-              id: req.transferId, type: 'incoming', name: req.senderName, fileName: req.fileName, progress: 0, status: "Waiting...", downloadUrl: null
-          }]);
-      }
-      socketRef.current.emit('response_transfer', { to: req.from, accepted, transferId: req.transferId });
-  }, []);
-
-  // --- ENGINE LOGIC (Standard, No changes needed for memoization) ---
   const checkStalledTransfers = () => {
       const now = Date.now();
       transferEngines.current.forEach((engine, transferId) => {
@@ -134,7 +117,13 @@ export default function FileTransfer({ authData }) {
       });
   };
 
-  const sendToSelected = useCallback(() => {
+  const updateTransferUI = (id, updates) => {
+      setTransfers(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
+  };
+
+  const handleUserToggle = (uid) => setSelectedUsers(prev => prev.includes(uid) ? prev.filter(id => id !== uid) : [...prev, uid]);
+
+  const sendToSelected = () => {
       if (!selectedFile || selectedUsers.length === 0) return alert("Select file & users!");
       selectedUsers.forEach(targetId => {
           const transferId = generateId();
@@ -151,7 +140,7 @@ export default function FileTransfer({ authData }) {
           });
       });
       setSelectedUsers([]);
-  }, [selectedFile, selectedUsers, users, authData.username]); 
+  };
 
   const startUploadEngine = (transferId) => {
       const engine = transferEngines.current.get(transferId);
@@ -195,6 +184,19 @@ export default function FileTransfer({ authData }) {
       reader.readAsArrayBuffer(blob);
   };
 
+  const handleIncomingDecision = (req, accepted) => {
+      setIncomingReqs(prev => prev.filter(r => r.transferId !== req.transferId));
+      if (accepted) {
+          transferEngines.current.set(req.transferId, {
+              type: 'receive', fileSize: req.fileSize, fileName: req.fileName, chunkMap: new Map(), receivedBytes: 0, senderId: req.from, lastActivity: Date.now()
+          });
+          setTransfers(prev => [...prev, {
+              id: req.transferId, type: 'incoming', name: req.senderName, fileName: req.fileName, progress: 0, status: "Waiting...", downloadUrl: null
+          }]);
+      }
+      socketRef.current.emit('response_transfer', { to: req.from, accepted, transferId: req.transferId });
+  };
+
   const finalizeDownload = (transferId) => {
       const engine = transferEngines.current.get(transferId);
       if (!engine || engine.finalized) return;
@@ -214,48 +216,44 @@ export default function FileTransfer({ authData }) {
   return (
     <div style={{ maxWidth: '1000px', margin: '0 auto', fontFamily: 'Segoe UI, sans-serif' }}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginTop: '20px' }}>
-            
-            {/* SENDER PANEL */}
             <div style={{ background: '#f7fafc', padding: '20px', borderRadius: '12px', border: '1px solid #edf2f7' }}>
                 <h3 style={{marginTop:0}}>📤 Send File</h3>
                 <input type="file" onChange={(e) => setSelectedFile(e.target.files[0])} style={{ marginBottom: '15px', display: 'block', width: '100%' }} />
-                
-                {/* MEMOIZED USER LIST */}
-                <UserList 
-                    users={users} 
-                    myId={socketRef.current?.id} 
-                    selectedUsers={selectedUsers} 
-                    onToggle={handleUserToggle} 
-                />
-                
-                <button onClick={sendToSelected} style={{ width: '100%', marginTop: '15px', padding: '12px', background: '#3182ce', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', opacity: (!selectedFile || selectedUsers.length === 0) ? 0.5 : 1 }}>Send</button>
+                <div style={{ maxHeight: '200px', overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: '6px', background: 'white' }}>
+                    {Object.entries(users).map(([id, name]) => id !== socketRef.current?.id && (
+                        <div key={id} onClick={() => handleUserToggle(id)} style={{ padding: '10px', cursor: 'pointer', background: selectedUsers.includes(id) ? '#ebf8ff' : 'transparent', borderBottom: '1px solid #eee' }}>
+                            {name} {selectedUsers.includes(id) && '✓'}
+                        </div>
+                    ))}
+                </div>
+                <button onClick={sendToSelected} style={{ width: '100%', marginTop: '15px', padding: '12px', background: '#3182ce', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer' }}>Send</button>
             </div>
 
-            {/* DASHBOARD PANEL */}
             <div style={{ background: 'white', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px rgba(0,0,0,0.1)' }}>
                 <h3 style={{marginTop:0}}>📊 Transfers</h3>
                 <div style={{ maxHeight: '500px', overflowY: 'auto' }}>
-                    {transfers.length === 0 && <p style={{color:'gray', textAlign:'center'}}>No active transfers</p>}
-                    
-                    {/* MEMOIZED TRANSFER CARDS */}
                     {transfers.map(t => (
-                        <TransferCard key={t.id} transfer={t} />
+                        <div key={t.id} style={{ marginBottom: '15px', padding: '10px', background: t.type === 'outgoing' ? '#ebf8ff' : '#f0fff4', borderRadius: '8px', borderLeft: `4px solid ${t.type === 'outgoing' ? '#3182ce' : '#38b2ac'}` }}>
+                            <div style={{display:'flex', justifyContent:'space-between'}}><strong>{t.type === 'outgoing' ? `To: ${t.name}` : `From: ${t.name}`}</strong> <small>{t.status}</small></div>
+                            <div style={{ fontSize: '0.9em', margin: '5px 0' }}>{t.fileName}</div>
+                            <div style={{ width: '100%', height: '6px', background: '#cbd5e0', borderRadius: '3px' }}><div style={{ width: `${t.progress}%`, height: '100%', background: t.type === 'outgoing' ? '#3182ce' : '#38b2ac', transition: 'width 0.2s' }}></div></div>
+                            {t.downloadUrl && <a href={t.downloadUrl} download={t.fileName} style={{ display: 'inline-block', marginTop: '5px', color: '#276749', textDecoration: 'none', fontWeight: 'bold' }}>⬇ Save</a>}
+                        </div>
                     ))}
                 </div>
             </div>
         </div>
 
-        {/* POPUPS */}
-        <div style={{ position: 'fixed', bottom: '20px', right: '20px', zIndex: 999 }}>
-            {/* MEMOIZED REQUEST POPUPS */}
-            {incomingReqs.map((req) => (
-                <IncomingRequest 
-                    key={req.transferId} 
-                    req={req} 
-                    onDecision={handleIncomingDecision} 
-                />
-            ))}
-        </div>
+        {incomingReqs.map((req, idx) => (
+            <div key={idx} style={{ position: 'fixed', bottom: '20px', right: '20px', background: 'white', padding: '15px', borderRadius: '8px', boxShadow: '0 10px 15px rgba(0,0,0,0.1)', border: '1px solid #cbd5e0', zIndex: 999 }}>
+                <h4>📥 {req.fileName}</h4>
+                <p>From: {req.senderName}</p>
+                <div style={{ display: 'flex', gap: '10px' }}>
+                    <button onClick={() => handleIncomingDecision(req, true)} style={{ background: '#48bb78', color: 'white', border: 'none', padding: '5px 10px', borderRadius: '4px' }}>Accept</button>
+                    <button onClick={() => handleIncomingDecision(req, false)} style={{ background: '#f56565', color: 'white', border: 'none', padding: '5px 10px', borderRadius: '4px' }}>Reject</button>
+                </div>
+            </div>
+        ))}
     </div>
   );
 }
