@@ -40,13 +40,16 @@ export default function App() {
 
     // 3. Authenticated App
     return (
-        <div style={{ minHeight: '100vh', background: '#f7fafc' }}>
+        <div style={{ minHeight: '100vh', background: '#f7fafc', paddingBottom: '50px' }}>
             {/* Header */}
             <div style={{ background: 'white', padding: '15px 30px', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <h2 style={{ margin: 0, color: '#2d3748' }}>🚀 LAN Share Pro</h2>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
-                    <span style={{ color: '#4a5568' }}>User: <strong>{auth.username}</strong></span>
-                    <button onClick={handleLogout} style={{ background: '#e53e3e', color: 'white', border: 'none', padding: '8px 15px', borderRadius: '5px', cursor: 'pointer' }}>Logout</button>
+                    <div style={{textAlign:'right'}}>
+                        <span style={{ display:'block', color: '#4a5568', fontSize:'0.9em' }}>Logged in as</span>
+                        <strong style={{color:'#2d3748'}}>{auth.username}</strong>
+                    </div>
+                    <button onClick={handleLogout} style={{ background: '#e53e3e', color: 'white', border: 'none', padding: '8px 15px', borderRadius: '5px', cursor: 'pointer', fontWeight:'bold' }}>Logout</button>
                 </div>
             </div>
 

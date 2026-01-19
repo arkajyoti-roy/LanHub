@@ -1,309 +1,464 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import io from 'socket.io-client';
+import axios from 'axios';
+import IncomingRequest from './transfer/IncomingRequest';
 
 const SOCKET_URL = `http://${window.location.hostname}:5000`;
+const API_URL = `http://${window.location.hostname}:5000`;
 
-// 🚀 TURBO CONFIG: 1MB Chunks + 64 Window = Up to 64MB in-flight data
 const CHUNK_SIZE = 1 * 1024 * 1024; 
 const MAX_WINDOW_SIZE = 64; 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
 export default function FileTransfer({ authData }) {
   const socketRef = useRef(null);
+  const chatBottomRef = useRef(null);
   
-  const [isConnected, setIsConnected] = useState(false);
-  const [users, setUsers] = useState({});
+  // --- STATE ---
+  const [onlineUsers, setOnlineUsers] = useState({}); 
+  const [historyLogs, setHistoryLogs] = useState([]);
+  const [transfers, setTransfers] = useState([]); // ACTIVE transfers
+  const [incomingReqs, setIncomingReqs] = useState([]); 
+  
+  const [selectedUser, setSelectedUser] = useState(null); 
   const [selectedFile, setSelectedFile] = useState(null);
-  const [selectedUsers, setSelectedUsers] = useState([]);
-  const [transfers, setTransfers] = useState([]);
-  const [incomingReqs, setIncomingReqs] = useState([]);
 
   const transferEngines = useRef(new Map());
   const watchdogRef = useRef(null);
 
-  // --- UI UPDATER (Memoized for Performance) ---
-  const updateTransferUI = useCallback((id, updates) => {
-      setTransfers(prev => {
-          const index = prev.findIndex(t => t.id === id);
-          if (index === -1) return prev;
-          const newTransfers = [...prev];
-          newTransfers[index] = { ...newTransfers[index], ...updates };
-          return newTransfers;
-      });
-  }, []);
-
-  // --- SOCKET SETUP ---
+  // --- 1. SETUP & LISTENERS ---
   useEffect(() => {
-    // Auth Handshake
+    fetchHistory();
+    
     socketRef.current = io(SOCKET_URL, {
         auth: { token: authData.token },
-        reconnection: true,
-        transports: ['websocket']
+        reconnection: true, transports: ['websocket']
     });
 
     const socket = socketRef.current;
-    socket.on('connect', () => setIsConnected(true));
-    socket.on('disconnect', () => setIsConnected(false));
-    socket.on('users_update', (u) => setUsers(u));
-
-    // 🐕 SMART WATCHDOG: Checks frequently (1s) but tolerates lag
-    watchdogRef.current = setInterval(checkStalledTransfers, 1000);
-
-    // --- EVENT LISTENERS ---
+    
+    socket.on('connect', () => console.log("✅ Socket Connected"));
+    socket.on('users_update', (u) => setOnlineUsers(u));
 
     socket.on('incoming_request', (data) => {
-        setIncomingReqs(prev => prev.find(r => r.transferId === data.transferId) ? prev : [...prev, data]);
+        setIncomingReqs(prev => {
+            if (prev.find(r => r.transferId === data.transferId)) return prev;
+            return [...prev, data];
+        });
     });
 
     socket.on('request_response', (data) => {
-        if (data.accepted) setTimeout(() => startUploadEngine(data.transferId), 50);
-        else updateTransferUI(data.transferId, { status: "Rejected ❌", progress: 0 });
-    });
-
-    // 🚀 SPEED LOGIC: The "Heartbeat" of the transfer
-    socket.on('ack_received', (data) => {
-        const engine = transferEngines.current.get(data.transferId);
-        if (!engine || !engine.active) return;
-        
-        // 1. Update confirmed position
-        if (data.offset > engine.highestAckedOffset) {
-            engine.highestAckedOffset = data.offset;
-        }
-
-        // 2. Register Activity (Feeds the Watchdog)
-        engine.lastActivity = Date.now();
-        engine.chunksInFlight = Math.max(0, engine.chunksInFlight - 1);
-        
-        // 3. ADAPTIVE ACCELERATION
-        // If ACKs come fast (<100ms), we grow the window aggressively
-        const timeDiff = Date.now() - engine.lastAckTime;
-        if (timeDiff < 100) engine.windowSize = Math.min(engine.windowSize + 2, MAX_WINDOW_SIZE);
-        else if (timeDiff < 300) engine.windowSize = Math.min(engine.windowSize + 1, MAX_WINDOW_SIZE);
-        // We do NOT shrink window unless stall is detected (maintains speed)
-        
-        engine.lastAckTime = Date.now();
-
-        // 4. CHECK COMPLETION
-        // If the confirmed bytes + 1 chunk covers the whole file, we are done.
-        const fileEnd = engine.file.size;
-        if (engine.highestAckedOffset + CHUNK_SIZE >= fileEnd) {
-             finishSender(data.transferId, engine);
+        if (data.accepted) {
+            setTimeout(() => startUploadEngine(data.transferId), 100);
         } else {
-             // Keep Pumping Data!
-             pumpUploadPipeline(data.transferId);
+            updateTransferUI(data.transferId, { status: "Rejected ❌", progress: 0 });
         }
     });
 
-    socket.on('receive_chunk', (data) => {
-        const engine = transferEngines.current.get(data.transferId);
-        if (!engine) return;
-        
-        engine.lastActivity = Date.now();
-        if (!engine.chunkMap.has(data.offset)) {
-            engine.chunkMap.set(data.offset, data.chunk);
-            engine.receivedBytes += data.chunk.byteLength;
-        }
-        
-        // IMMEDIATE ACK: Critical for high speed
-        socket.emit('window_ack', { to: data.from, offset: data.offset, transferId: data.transferId });
-
-        const pct = Math.floor((engine.receivedBytes / data.total) * 100);
-        if (pct % 5 === 0 || pct >= 100) updateTransferUI(data.transferId, { progress: pct, status: `Downloading ${pct}%` });
-        
-        if (engine.receivedBytes >= engine.fileSize) finalizeDownload(data.transferId);
-    });
-
+    socket.on('ack_received', (data) => handleAck(data));
+    socket.on('receive_chunk', (data) => handleChunk(data));
     socket.on('transfer_completed', (data) => {
-        const engine = transferEngines.current.get(data.transferId);
-        // Only finalize if we actually have the data (Integrity Check)
-        if (engine && engine.receivedBytes >= engine.fileSize) finalizeDownload(data.transferId);
+        finalizeDownload(data.transferId);
+        // Do not fetch history immediately, let the UI showing "Done" persist for a moment
     });
 
-    return () => {
-        socket.disconnect();
-        clearInterval(watchdogRef.current);
-    };
-  }, [authData.token, updateTransferUI]); 
+    watchdogRef.current = setInterval(checkStalledTransfers, 1000);
 
-  // --- ENGINE LOGIC ---
+    return () => { socket.disconnect(); clearInterval(watchdogRef.current); };
+  }, [authData.token]);
+
+  useEffect(() => {
+      if (chatBottomRef.current) chatBottomRef.current.scrollIntoView({ behavior: 'smooth' });
+  }, [historyLogs, transfers, selectedUser]);
+
+
+  // --- 2. DATA MANAGEMENT ---
+
+  const fetchHistory = async () => {
+      try {
+          const res = await axios.get(`${API_URL}/api/history`, {
+              headers: { Authorization: `Bearer ${authData.token}` }
+          });
+          setHistoryLogs(res.data);
+      } catch (err) { console.error("History Error"); }
+  };
+
+  const contactList = useMemo(() => {
+      const contacts = new Set();
+      Object.entries(onlineUsers).forEach(([id, name]) => {
+          if (name !== authData.username) contacts.add(name);
+      });
+      historyLogs.forEach(log => {
+          const other = log.sender === authData.username ? log.receiver : log.sender;
+          if(other) contacts.add(other);
+      });
+
+      return Array.from(contacts).map(name => {
+          const socketId = Object.keys(onlineUsers).find(key => onlineUsers[key] === name);
+          return {
+              name,
+              isOnline: !!socketId,
+              socketId: socketId || null 
+          };
+      }).sort((a,b) => (b.isOnline - a.isOnline));
+  }, [onlineUsers, historyLogs, authData.username]);
+
+
+  // MERGE & DEDUPLICATE
+  const chatMessages = useMemo(() => {
+      if (!selectedUser) return [];
+
+      // 1. Active Transfers (Flagged as isActive: true)
+      const live = transfers
+          .filter(t => t.peerName === selectedUser.name)
+          .map(t => ({ ...t, isActive: true, timestamp: t.startTime }));
+
+      // 2. Past History (Database)
+      const past = historyLogs
+          .filter(l => l.sender === selectedUser.name || l.receiver === selectedUser.name)
+          .filter(l => {
+              // Deduplicate: If this file is currently active, hide the DB log
+              const isDuplicate = live.some(t => 
+                  t.fileName === l.fileName && 
+                  t.fileSize === l.fileSize && 
+                  Math.abs(new Date(t.startTime).getTime() - new Date(l.timestamp).getTime()) < 10000
+              );
+              return !isDuplicate;
+          })
+          .map(l => ({ ...l, isActive: false, id: l._id }));
+
+      return [...past, ...live].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  }, [selectedUser, historyLogs, transfers]);
+
+
+  // --- 3. SEND / RECEIVE LOGIC ---
+
+  const updateTransferUI = (id, updates) => {
+      setTransfers(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t));
+  };
+
+  const handleSendFile = () => {
+      if (!selectedFile || !selectedUser) return;
+      
+      const currentSocketId = Object.keys(onlineUsers).find(key => onlineUsers[key] === selectedUser.name);
+      
+      if (!currentSocketId) {
+          alert(`${selectedUser.name} is offline.`);
+          return;
+      }
+
+      const transferId = generateId();
+
+      // Initialize Engine
+      transferEngines.current.set(transferId, {
+          type: 'send', 
+          active: false, 
+          file: selectedFile, 
+          offset: 0, 
+          highestAckedOffset: 0, 
+          receiverId: currentSocketId,
+          receiverName: selectedUser.name, 
+          windowSize: 4, 
+          chunksInFlight: 0, 
+          lastAckTime: 0, 
+          lastActivity: Date.now()
+      });
+
+      setTransfers(prev => [...prev, {
+          id: transferId,
+          peerName: selectedUser.name, 
+          type: 'outgoing', // Used for bubble color
+          fileName: selectedFile.name,
+          fileSize: selectedFile.size,
+          progress: 0,
+          status: "Waiting...",
+          startTime: Date.now()
+      }]);
+
+      socketRef.current.emit('request_transfer', {
+          to: currentSocketId,
+          transferId,
+          senderName: authData.username,
+          fileName: selectedFile.name,
+          fileSize: selectedFile.size
+      });
+      
+      setSelectedFile(null);
+  };
+
+  const handleIncomingDecision = (req, accepted) => {
+      setIncomingReqs(prev => prev.filter(r => r.transferId !== req.transferId));
+      
+      if (accepted) {
+          transferEngines.current.set(req.transferId, {
+              type: 'receive', fileSize: req.fileSize, fileName: req.fileName, 
+              chunkMap: new Map(), receivedBytes: 0, senderId: req.from, 
+              lastActivity: Date.now()
+          });
+
+          setTransfers(prev => [...prev, {
+              id: req.transferId,
+              peerName: req.senderName, 
+              type: 'incoming', // Used for bubble color
+              fileName: req.fileName,
+              fileSize: req.fileSize,
+              progress: 0,
+              status: "Starting...",
+              startTime: Date.now()
+          }]);
+      }
+      
+      socketRef.current.emit('response_transfer', { 
+          to: req.from, accepted, transferId: req.transferId 
+      });
+  };
+
+  // --- 4. ENGINE CORE ---
+  const startUploadEngine = (id) => {
+      const e = transferEngines.current.get(id);
+      if(e) { e.active=true; e.lastActivity=Date.now(); updateTransferUI(id, {status:"Sending..."}); pumpUploadPipeline(id); }
+  };
+
+  const handleAck = (data) => {
+      const engine = transferEngines.current.get(data.transferId);
+      if (!engine || !engine.active) return;
+      if (data.offset > engine.highestAckedOffset) engine.highestAckedOffset = data.offset;
+      engine.chunksInFlight = Math.max(0, engine.chunksInFlight - 1);
+      engine.lastActivity = Date.now();
+      
+      const timeDiff = Date.now() - engine.lastAckTime;
+      if (timeDiff < 100) engine.windowSize = Math.min(engine.windowSize + 2, MAX_WINDOW_SIZE);
+      else if (timeDiff < 300) engine.windowSize = Math.min(engine.windowSize + 1, MAX_WINDOW_SIZE);
+      engine.lastAckTime = Date.now();
+
+      if (engine.highestAckedOffset + CHUNK_SIZE >= engine.file.size) finishSender(data.transferId, engine);
+      else pumpUploadPipeline(data.transferId);
+  };
+
+  const handleChunk = (data) => {
+      const engine = transferEngines.current.get(data.transferId);
+      if (!engine) return;
+      engine.lastActivity = Date.now();
+      if (!engine.chunkMap.has(data.offset)) { engine.chunkMap.set(data.offset, data.chunk); engine.receivedBytes += data.chunk.byteLength; }
+      socketRef.current.emit('window_ack', { to: data.from, offset: data.offset, transferId: data.transferId });
+      
+      const pct = Math.floor((engine.receivedBytes / data.total) * 100);
+      if (pct % 5 === 0 || pct >= 100) updateTransferUI(data.transferId, { progress: pct, status: `Downloading ${pct}%` });
+      if (engine.receivedBytes >= engine.fileSize) finalizeDownload(data.transferId);
+  };
+
+  const pumpUploadPipeline = (id) => { 
+      const e = transferEngines.current.get(id); 
+      if(!e || !e.active) return; 
+      while(e.active && e.chunksInFlight < e.windowSize && e.offset < e.file.size){ 
+          const blob = e.file.slice(e.offset, e.offset+CHUNK_SIZE); 
+          const r = new FileReader();
+          const currentOffset = e.offset;
+          r.onload=(evt)=>{ 
+             if(transferEngines.current.get(id)?.active) {
+                socketRef.current.emit('file_chunk', { transferId: id, from: socketRef.current.id, to: e.receiverId, chunk: evt.target.result, offset: currentOffset, total: e.file.size }); 
+                if(Math.random() > 0.7) { // Update UI often enough to see speed
+                    const pct=Math.round((currentOffset/e.file.size)*100);
+                    updateTransferUI(id, {progress:pct});
+                }
+             }
+          }; 
+          r.readAsArrayBuffer(blob);
+          e.offset+=CHUNK_SIZE; e.chunksInFlight++; e.lastActivity=Date.now(); 
+      } 
+  };
+
+  const finishSender = (id, e) => {
+      if(e.active){
+          const finalReceiverName = e.receiverName || onlineUsers[e.receiverId] || "Unknown";
+          socketRef.current.emit('transfer_completed', { 
+              transferId: id, 
+              sender: authData.username, 
+              receiver: finalReceiverName, 
+              receiverId: e.receiverId, 
+              fileName: e.file.name, 
+              fileSize: e.file.size 
+          }); 
+          
+          e.active=false; 
+          updateTransferUI(id, {status:"Sent ✅", progress:100});
+          setTimeout(fetchHistory, 1500); 
+      }
+  };
+
+  const finalizeDownload = (id) => { 
+      const e = transferEngines.current.get(id); if(!e||e.finalized)return; e.finalized=true; 
+      
+      // 1. SHOW "VERIFYING" STATUS
+      updateTransferUI(id, {status:"Verifying Integrity..."}); 
+      
+      setTimeout(()=>{ 
+          const b=new Blob(Array.from(e.chunkMap.entries()).sort((a,b)=>a[0]-b[0]).map(x=>x[1])); 
+          const url = URL.createObjectURL(b);
+          
+          // 2. SHOW "DONE" STATUS & DOWNLOAD LINK
+          updateTransferUI(id,{status:"Done ✅", progress:100, downloadUrl:url}); 
+          e.chunkMap.clear(); 
+          setTimeout(fetchHistory, 5000); 
+      }, 50); 
+  };
 
   const checkStalledTransfers = () => {
       const now = Date.now();
       transferEngines.current.forEach((engine, transferId) => {
           if (!engine.active) return;
-          
-          // If stuck for > 2.5 seconds (tuned for 2.4GHz latency)
-          if (now - engine.lastActivity > 2500) {
-              if (engine.type === 'send') {
-                  
-                  // 🧠 SMART REWIND: 
-                  // Don't kill the speed (windowSize=1 is too slow).
-                  // Instead, cut window in half. This keeps momentum.
-                  const newWindow = Math.max(4, Math.floor(engine.windowSize / 2));
-                  
-                  // console.warn(`⚠️ Rewinding ${transferId}. Window: ${engine.windowSize} -> ${newWindow}`);
-
-                  // Rewind position to last safe spot
-                  engine.offset = engine.highestAckedOffset || 0;
-                  engine.windowSize = newWindow;
-                  engine.chunksInFlight = 0; 
-                  
-                  updateTransferUI(transferId, { status: "Optimizing..." });
-                  pumpUploadPipeline(transferId);
-              }
-              engine.lastActivity = now; 
+          if (now - engine.lastActivity > 2500 && engine.type === 'send') {
+               engine.offset = engine.highestAckedOffset || 0;
+               engine.windowSize = Math.max(4, Math.floor(engine.windowSize / 2));
+               engine.chunksInFlight = 0;
+               updateTransferUI(transferId, { status: "Optimizing Connection..." });
+               pumpUploadPipeline(transferId);
+               engine.lastActivity = now;
           }
       });
   };
 
-  const sendToSelected = useCallback(() => {
-      if (!selectedFile || selectedUsers.length === 0) return alert("Select file & users!");
-      selectedUsers.forEach(targetId => {
-          const transferId = generateId();
-          const targetName = users[targetId] || "Unknown";
-          
-          transferEngines.current.set(transferId, {
-              type: 'send', active: false, file: selectedFile, 
-              offset: 0, highestAckedOffset: 0,
-              receiverId: targetId, windowSize: 4, // Start slightly faster
-              chunksInFlight: 0, lastAckTime: 0, lastActivity: Date.now()
-          });
-          
-          setTransfers(prev => [...prev, {
-              id: transferId, type: 'outgoing', name: targetName, fileName: selectedFile.name, progress: 0, status: "Waiting...", downloadUrl: null
-          }]);
-          
-          socketRef.current.emit('request_transfer', {
-              to: targetId, transferId, senderName: authData.username, fileName: selectedFile.name, fileSize: selectedFile.size
-          });
-      });
-      setSelectedUsers([]);
-  }, [selectedFile, selectedUsers, users, authData.username]); 
-
-  const startUploadEngine = (transferId) => {
-      const engine = transferEngines.current.get(transferId);
-      if (!engine) return;
-      engine.active = true;
-      engine.lastActivity = Date.now();
-      updateTransferUI(transferId, { status: "Starting..." });
-      pumpUploadPipeline(transferId);
-  };
-
-  const pumpUploadPipeline = (transferId) => {
-      const engine = transferEngines.current.get(transferId);
-      if (!engine || !engine.active) return;
-      
-      // Keep pumping until the window is full
-      while (engine.active && engine.chunksInFlight < engine.windowSize && engine.offset < engine.file.size) {
-          const offset = engine.offset;
-          const chunkBlob = engine.file.slice(offset, offset + CHUNK_SIZE);
-          
-          readAndSendChunk(transferId, chunkBlob, offset);
-          
-          engine.offset += CHUNK_SIZE;
-          engine.chunksInFlight++;
-          engine.lastActivity = Date.now(); // Mark as active so watchdog sleeps
-      }
-  };
-
-  const readAndSendChunk = (transferId, blob, offset) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-          const engine = transferEngines.current.get(transferId);
-          if (!engine || !engine.active) return;
-          
-          socketRef.current.emit('file_chunk', {
-              transferId, from: socketRef.current.id, to: engine.receiverId, 
-              chunk: e.target.result, offset, total: engine.file.size
-          });
-          
-          // UI update (throttled for performance)
-          const pct = Math.round((offset / engine.file.size) * 100);
-          if (pct % 5 === 0) updateTransferUI(transferId, { status: `Sending ${pct}%`, progress: pct });
-      };
-      reader.readAsArrayBuffer(blob);
-  };
-
-  const finishSender = (transferId, engine) => {
-      if(!engine.active) return;
-      
-      socketRef.current.emit('transfer_completed', {
-          transferId, sender: authData.username, receiverId: engine.receiverId, fileName: engine.file.name, fileSize: engine.file.size
-      });
-      
-      engine.active = false;
-      updateTransferUI(transferId, { status: "Sent ✅", progress: 100 });
-  };
-
-  const handleIncomingDecision = useCallback((req, accepted) => {
-      setIncomingReqs(prev => prev.filter(r => r.transferId !== req.transferId));
-      if (accepted) {
-          transferEngines.current.set(req.transferId, {
-              type: 'receive', fileSize: req.fileSize, fileName: req.fileName, chunkMap: new Map(), receivedBytes: 0, senderId: req.from, lastActivity: Date.now()
-          });
-          setTransfers(prev => [...prev, {
-              id: req.transferId, type: 'incoming', name: req.senderName, fileName: req.fileName, progress: 0, status: "Waiting...", downloadUrl: null
-          }]);
-      }
-      socketRef.current.emit('response_transfer', { to: req.from, accepted, transferId: req.transferId });
-  }, []);
-
-  const finalizeDownload = (transferId) => {
-      const engine = transferEngines.current.get(transferId);
-      if (!engine || engine.finalized) return;
-      engine.finalized = true;
-      updateTransferUI(transferId, { status: "Verifying..." });
-      setTimeout(() => {
-          const sortedChunks = Array.from(engine.chunkMap.entries()).sort((a, b) => a[0] - b[0]).map(e => e[1]);
-          const blob = new Blob(sortedChunks);
-          if (blob.size !== engine.fileSize) { updateTransferUI(transferId, { status: "Integrity Error ❌" }); return; }
-          const url = URL.createObjectURL(blob);
-          updateTransferUI(transferId, { status: "Done ✅", progress: 100, downloadUrl: url });
-          engine.chunkMap.clear();
-          transferEngines.current.delete(transferId);
-      }, 50);
-  };
-
+  // --- RENDER ---
   return (
-    <div style={{ maxWidth: '1000px', margin: '0 auto', fontFamily: 'Segoe UI, sans-serif' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginTop: '20px' }}>
-            <div style={{ background: '#f7fafc', padding: '20px', borderRadius: '12px', border: '1px solid #edf2f7' }}>
-                <h3 style={{marginTop:0}}>📤 Send File</h3>
-                <input type="file" onChange={(e) => setSelectedFile(e.target.files[0])} style={{ marginBottom: '15px', display: 'block', width: '100%' }} />
-                <div style={{ maxHeight: '200px', overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: '6px', background: 'white' }}>
-                    {Object.entries(users).map(([id, name]) => id !== socketRef.current?.id && (
-                        <div key={id} onClick={() => setSelectedUsers(p => p.includes(id) ? p.filter(x=>x!==id):[...p,id])} style={{ padding: '10px', cursor: 'pointer', background: selectedUsers.includes(id) ? '#ebf8ff' : 'transparent', borderBottom: '1px solid #eee' }}>
-                            {name} {selectedUsers.includes(id) && '✓'}
-                        </div>
-                    ))}
-                </div>
-                <button onClick={sendToSelected} style={{ width: '100%', marginTop: '15px', padding: '12px', background: '#3182ce', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer' }}>Send</button>
+    <div style={{ maxWidth: '1200px', margin: '20px auto', fontFamily: 'Segoe UI, sans-serif', display: 'grid', gridTemplateColumns: '300px 1fr', height: '80vh', background: 'white', borderRadius: '12px', boxShadow: '0 5px 15px rgba(0,0,0,0.1)', overflow: 'hidden' }}>
+        
+        {/* LEFT SIDEBAR */}
+        <div style={{ borderRight: '1px solid #e2e8f0', background: '#fff', display: 'flex', flexDirection: 'column' }}>
+            <div style={{ padding: '15px', background: '#f7fafc', borderBottom: '1px solid #e2e8f0' }}>
+                <h3 style={{ margin: 0, color: '#2d3748' }}>Chats</h3>
             </div>
-
-            <div style={{ background: 'white', padding: '20px', borderRadius: '12px', border: '1px solid #e2e8f0', boxShadow: '0 4px 6px rgba(0,0,0,0.1)' }}>
-                <h3 style={{marginTop:0}}>📊 Transfers</h3>
-                <div style={{ maxHeight: '500px', overflowY: 'auto' }}>
-                    {transfers.map(t => (
-                        <div key={t.id} style={{ marginBottom: '15px', padding: '10px', background: t.type === 'outgoing' ? '#ebf8ff' : '#f0fff4', borderRadius: '8px', borderLeft: `4px solid ${t.type === 'outgoing' ? '#3182ce' : '#38b2ac'}` }}>
-                            <div style={{display:'flex', justifyContent:'space-between'}}><strong>{t.type === 'outgoing' ? `To: ${t.name}` : `From: ${t.name}`}</strong> <small>{t.status}</small></div>
-                            <div style={{ fontSize: '0.9em', margin: '5px 0' }}>{t.fileName}</div>
-                            <div style={{ width: '100%', height: '6px', background: '#cbd5e0', borderRadius: '3px' }}><div style={{ width: `${t.progress}%`, height: '100%', background: t.type === 'outgoing' ? '#3182ce' : '#38b2ac', transition: 'width 0.2s' }}></div></div>
-                            {t.downloadUrl && <a href={t.downloadUrl} download={t.fileName} style={{ display: 'inline-block', marginTop: '5px', color: '#276749', textDecoration: 'none', fontWeight: 'bold' }}>⬇ Save</a>}
+            <div style={{ flex: 1, overflowY: 'auto' }}>
+                {contactList.map(contact => (
+                    <div 
+                        key={contact.name}
+                        onClick={() => setSelectedUser(contact)}
+                        style={{ 
+                            padding: '15px', cursor: 'pointer', 
+                            background: selectedUser?.name === contact.name ? '#ebf8ff' : 'white',
+                            borderLeft: selectedUser?.name === contact.name ? '4px solid #3182ce' : '4px solid transparent',
+                            display: 'flex', alignItems: 'center', borderBottom:'1px solid #f7fafc'
+                        }}
+                    >
+                        <div style={{ position:'relative', width:'40px', height:'40px', borderRadius:'50%', background:'#cbd5e0', marginRight:'12px', display:'flex', alignItems:'center', justifyContent:'center', color:'white', fontWeight:'bold' }}>
+                            {contact.name.charAt(0).toUpperCase()}
+                            {contact.isOnline && <div style={{ position:'absolute', bottom:0, right:0, width:'10px', height:'10px', background:'#48bb78', borderRadius:'50%', border:'2px solid white'}}></div>}
                         </div>
-                    ))}
-                </div>
+                        <div>
+                            <div style={{ fontWeight: '600', color: '#2d3748' }}>{contact.name}</div>
+                            <div style={{ fontSize: '0.8em', color: contact.isOnline ? '#48bb78' : '#a0aec0' }}>
+                                {contact.isOnline ? 'Online' : 'Offline'}
+                            </div>
+                        </div>
+                    </div>
+                ))}
             </div>
         </div>
-        {incomingReqs.map((req, idx) => (
-            <div key={idx} style={{ position: 'fixed', bottom: '20px', right: '20px', background: 'white', padding: '15px', borderRadius: '8px', boxShadow: '0 10px 15px rgba(0,0,0,0.1)', border: '1px solid #cbd5e0', zIndex: 999 }}>
-                <h4>📥 {req.fileName}</h4>
-                <p>From: {req.senderName}</p>
-                <div style={{ display: 'flex', gap: '10px' }}>
-                    <button onClick={() => handleIncomingDecision(req, true)} style={{ background: '#48bb78', color: 'white', border: 'none', padding: '5px 10px', borderRadius: '4px' }}>Accept</button>
-                    <button onClick={() => handleIncomingDecision(req, false)} style={{ background: '#f56565', color: 'white', border: 'none', padding: '5px 10px', borderRadius: '4px' }}>Reject</button>
-                </div>
+
+        {/* RIGHT PANEL */}
+        <div style={{ display: 'flex', flexDirection: 'column', background: '#e5ddd5' }}>
+            
+            {/* Header */}
+            <div style={{ padding: '15px', background: 'white', borderBottom: '1px solid #e2e8f0', display:'flex', alignItems:'center' }}>
+                {selectedUser ? (
+                    <>
+                        <div style={{ width:'35px', height:'35px', borderRadius:'50%', background:'#3182ce', color:'white', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:'bold', marginRight:'10px' }}>
+                            {selectedUser.name.charAt(0).toUpperCase()}
+                        </div>
+                        <div>
+                            <div style={{ fontWeight: 'bold' }}>{selectedUser.name}</div>
+                            {selectedUser.isOnline && <div style={{ fontSize: '0.75em', color: '#48bb78' }}>● Online</div>}
+                        </div>
+                    </>
+                ) : <div style={{ color: '#718096' }}>Select a user</div>}
             </div>
-        ))}
+
+            {/* Messages Area */}
+            <div style={{ flex: 1, padding: '20px', overflowY: 'auto' }}>
+                {selectedUser ? (
+                    chatMessages.map((msg, idx) => {
+                        const isMe = (msg.type === 'outgoing') || (msg.sender === authData.username);
+                        
+                        // 🟢 FIX: We treat it as 'active' if isActive is true OR if it's not a history log yet
+                        const showProgress = msg.isActive === true; 
+
+                        return (
+                            <div key={idx} style={{ display: 'flex', justifyContent: isMe ? 'flex-end' : 'flex-start', marginBottom: '15px' }}>
+                                <div style={{ 
+                                    maxWidth: '60%', minWidth: '220px',
+                                    background: isMe ? '#dcf8c6' : 'white', 
+                                    padding: '10px', borderRadius: '8px', boxShadow: '0 1px 2px rgba(0,0,0,0.1)'
+                                }}>
+                                    
+                                    <div style={{ display:'flex', alignItems:'center', marginBottom:'8px' }}>
+                                        <div style={{ fontSize:'24px', marginRight:'10px' }}>📄</div>
+                                        <div style={{ fontWeight: 'bold', wordBreak:'break-all', fontSize:'0.95em' }}>{msg.fileName}</div>
+                                    </div>
+
+                                    {/* 🟢 ALWAYS SHOW PROGRESS & STATUS FOR ACTIVE TRANSFERS */}
+                                    {showProgress ? (
+                                        <div style={{ marginBottom:'5px' }}>
+                                            <div style={{ width:'100%', height:'6px', background:'rgba(0,0,0,0.1)', borderRadius:'3px' }}>
+                                                <div style={{ width:`${msg.progress}%`, height:'100%', background: isMe ? '#128c7e' : '#3182ce', transition:'width 0.2s' }}></div>
+                                            </div>
+                                            <div style={{ fontSize:'0.75em', marginTop:'4px', display:'flex', justifyContent:'space-between', fontWeight:'bold', color: '#555' }}>
+                                                {/* This renders "Verifying...", "Sending...", etc */}
+                                                <span>{msg.status}</span> 
+                                                <span>{msg.progress}%</span>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        /* Static History Info */
+                                        <div style={{ fontSize:'0.8em', color:'#666', display:'flex', justifyContent:'space-between', alignItems:'center', marginTop:'5px' }}>
+                                            <span>{(msg.fileSize / 1024 / 1024).toFixed(2)} MB</span>
+                                            <span style={{ display:'flex', alignItems:'center' }}>
+                                                {new Date(msg.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}
+                                                {isMe && <span style={{ marginLeft:'5px', color:'#4fc3f7' }}>✓✓</span>}
+                                            </span>
+                                        </div>
+                                    )}
+
+                                    {/* Download Button */}
+                                    {(msg.downloadUrl) && (
+                                        <a href={msg.downloadUrl} download={msg.fileName} style={{ display:'block', textAlign:'center', marginTop:'8px', padding:'8px', background:'#34b7f1', color:'white', borderRadius:'4px', textDecoration:'none', fontWeight:'bold', fontSize:'0.9em' }}>
+                                            ⬇ Save File
+                                        </a>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })
+                ) : (
+                    <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#a0aec0', flexDirection: 'column' }}>
+                        <div style={{ fontSize: '40px', marginBottom: '10px' }}>👋</div>
+                        <div>Select a contact to share files</div>
+                    </div>
+                )}
+                <div ref={chatBottomRef} />
+            </div>
+
+            {/* Footer */}
+            {selectedUser && (
+                <div style={{ padding: '15px', background: '#f0f0f0', borderTop: '1px solid #ccc', display:'flex', gap:'10px', alignItems:'center' }}>
+                    <label style={{ cursor:'pointer', background:'white', padding:'10px 15px', borderRadius:'20px', border:'1px solid #ccc', display:'flex', alignItems:'center', color:'#555' }}>
+                        📎 <span style={{marginLeft:'5px'}}>{selectedFile ? selectedFile.name : "Choose File"}</span>
+                        <input type="file" onChange={(e) => setSelectedFile(e.target.files[0])} style={{ display: 'none' }} />
+                    </label>
+                    <button 
+                        onClick={handleSendFile}
+                        disabled={!selectedFile || !selectedUser.isOnline}
+                        style={{ flex: 1, padding: '12px', borderRadius: '20px', border: 'none', background: (selectedFile && selectedUser.isOnline) ? '#128c7e' : '#ccc', color: 'white', fontWeight: 'bold', cursor: (selectedFile && selectedUser.isOnline) ? 'pointer' : 'not-allowed' }}
+                    >
+                        Send ➤
+                    </button>
+                </div>
+            )}
+        </div>
+
+        {/* Global Popups */}
+        <div style={{ position: 'fixed', bottom: '20px', right: '20px', zIndex: 9999 }}>
+            {incomingReqs.map((req) => (<IncomingRequest key={req.transferId} req={req} onDecision={handleIncomingDecision} />))}
+        </div>
+
     </div>
   );
 }
